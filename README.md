@@ -1,215 +1,137 @@
-# RAG 数据预处理与智能检索系统
+# RAG 数据预处理系统
 
-## 项目概述
+一个可扩展的多格式文档向量化预处理系统，将 Word、PDF、Excel、图片等文档经过 **解析 → 语义分块 → 向量化 → 存储** 流水线处理，为 RAG（检索增强生成）系统的向量数据库提供格式化数据。
 
-一个**生产级、开箱即用**的 RAG（检索增强生成）全链路系统，覆盖从多格式文档解析到 3 层智能检索的完整流程。只需将文档放入文件夹，一行命令完成向量化；一行命令开始检索。支持**完全断网运行**，零外部依赖泄露风险，已通过严格的安全审计。
+> **快速开始**: 将文档放入 `knowledge_base/` 文件夹，运行 `python main.py` 即可。
 
-**核心流程：**  `文档放入 → 自动解析 → 语义分块 → 向量化 → 向量库存储 → 3层召回检索 → LLM 答案生成`
-
----
-
-## 技术栈
-
-| 层级 | 技术选型 | 版本要求 | 说明 |
-|------|----------|----------|------|
-| **运行环境** | Python | 3.10+ | 纯 Python 实现，无编译依赖 |
-| **文档解析** | python-docx, python-pptx, PyMuPDF, pytesseract, pdf2image, pandas, openpyxl, xlrd | 见 requirements.txt | 7 类格式全覆盖 |
-| **嵌入模型** | scikit-learn (TF-IDF), sentence-transformers (MiniLM / bge / e5) | scikit-learn≥1.3, sentence-transformers≥2.2 | 离线/在线双模式，一行配置切换 |
-| **向量存储** | ChromaDB (嵌入式), Milvus (分布式预留), CSV/Excel (本地回退) | chromadb≥0.4 | 自动检测可用性 → 智能降级 |
-| **检索引擎** | FAISS + sklearn BM25 | numpy≥1.24 | 完全本地化，零网络依赖 |
-| **重排序** | CrossEncoder (sentence-transformers), LLM API (OpenAI 兼容) | 可选 | 精排提升准确率 |
-| **LLM 接入** | OpenAI / Ollama / vLLM / DeepSeek 等全兼容 | 可选 | 统一 `/chat/completions` 接口 |
-| **OCR** | Tesseract + 大津法二值化 + 对比度拉伸 | tesseract≥5.0 | 中英文混合识别 |
-| **安全** | 零遥测、API Key 环境变量、无硬编码密钥、绝对路径脱敏 | — | 已通过完整安全审计 |
-
----
-
-## 核心功能
-
-### 一、文档解析引擎（7 类格式，8 个处理器）
-
-| 处理器 | 支持格式 | 核心技术 | 特色能力 |
-|--------|----------|----------|----------|
-| **WordProcessor** | `.docx` | python-docx + XML 解析 | 双栏/多栏布局检测、表格/页眉/页脚/文本框提取 |
-| **DocProcessor** | `.doc` | LibreOffice → antiword → textract 三级回退 | 兼容 Word 97-2003 二进制格式 |
-| **PDFProcessor** | `.pdf` | PyMuPDF 直接提取 → Tesseract OCR 回退 | 文字型/扫描件自适应、分批处理防内存溢出 |
-| **ExcelProcessor** | `.xlsx` `.xls` | pandas + openpyxl/xlrd | 多 Sheet 遍历、行列坐标保留 |
-| **PptxProcessor** | `.pptx` | python-pptx | 幻灯片正文 + 演讲者备注 |
-| **ImageProcessor** | `.png` `.jpg` `.bmp` `.tiff` | pytesseract + PIL 预处理 | 灰度化→中值滤波→对比度拉伸→OCR |
-| **TextProcessor** | `.txt` `.md` `.csv` `.json` `.html` | 内置解析器 | HTML 标签剥离、JSON 展平、CSV 表格化 |
-
-**扩展方式**：继承 `BaseProcessor` 基类，实现 `can_handle()` 和 `extract_text()` 两个方法，注册即用。
-
-### 二、语义分块引擎
-
-与常见的固定字数暴力切分不同，本系统使用**基于嵌入向量相似度的自适应语义分块**：
-
-1. **初始分割**：按段落 → 句子层级将文本切分为基本语义单元
-2. **语义合并**：计算相邻单元的嵌入向量余弦相似度
-3. **贪婪合并**：相似度 ≥ 阈值自动合并，遇语义断点自动切分。使用均值向量追踪语义漂移
-4. **重叠窗口**：相邻 chunk 保留 15% 文本重叠，确保句子边界对齐
-5. **智能去重**：精确哈希 + 语义相似度双重去重
-
-**效果**：切割位置始终在"知识点边界"，不会在知识中间拦腰截断。
-
-### 三、向量化引擎（双模式）
-
-| 模式 | 技术方案 | 向量维度 | 适用场景 | 网络要求 |
-|------|----------|----------|----------|----------|
-| **离线 TF-IDF**（默认） | sklearn TfidfVectorizer，字符级 2~4 n-gram | 512（可配） | 零网络环境、快速部署 | 不需要 |
-| **在线模型** | Sentence-Transformers | 384~768（模型决定） | 高精度语义理解 | 首次需下载模型 |
-
-- **TF-IDF 全局拟合**：先收集全部 chunk → 统一 fit → 批量 encode，确保跨文件语义空间一致
-- 配置文件中一行切换：`USE_TFIDF = True / False`
-
-### 四、存储层
-
-```
-auto_detect_storage()  ← 启动时自动执行
-  ├─ ChromaDB 可用？ → 写入 ChromaDB + CSV 双备份
-  ├─ Milvus 可用？   → 写入 Milvus + CSV 双备份
-  └─ 都不行          → CSV 本地存储 + 清晰安装提示
-```
-
-| 特性 | 说明 |
-|------|------|
-| **自动检测** | 按 Chroma → Milvus → 文件顺序自动降级 |
-| **双写备份** | 向量库 + CSV 同时存储，数据零丢失风险 |
-| **向量库更新** | 文档修改后自动 `delete_by_source()` 清理旧版本 → 插入新版本 |
-| **独立导入** | `import_to_vectordb.py` 支持 CSV → 向量DB 一键批量导入 |
-| **增量处理** | 文件 MD5 哈希变更检测，跳过未变化文件 |
-| **预览模式** | `--dry-run` 列出待处理文件清单 |
-
-### 五、3 层召回检索系统
-
-```
-用户查询 "关键词"
-      │
-      ├─ Layer 1 ──────────────────────────────
-      │   BM25 关键词搜索 (权重 0.3)  ─┐
-      │   向量语义搜索 (权重 0.7)      ─┤─ 加权合并 → Top 20
-      │                                  │
-      ├─ Layer 2 ──────────────────────────────
-      │   BM25 关键词搜索 (权重 0.5)  ─┐
-      │   向量语义搜索 (权重 0.5)      ─┤─ 不同权重交叉补充 → Top 20
-      │                                  │
-      ├─ Layer 3 ──────────────────────────────
-      │   合并 Layer1 + Layer2 → 去重 → CrossEncoder/LLM 精排 → Top 5
-      │
-      └─ 多路合路 ─────────────────────────────
-          Prompt 模板 + LLM → 多路上下文融合 → 生成最终答案
-```
-
-| 组件 | 技术 | 说明 |
-|------|------|------|
-| **BM25 关键词** | sklearn TfidfVectorizer + IDF 权重 | 中文字符级 n-gram，精确匹配专有名词/编号/术语 |
-| **向量语义** | 余弦相似度批量计算 | 捕获同义词、改写、跨语言语义 |
-| **CrossEncoder 精排** | sentence-transformers CrossEncoder | Query-Document 联合编码，比双塔模型更精确 |
-| **LLM 精排** | OpenAI 兼容 API | 语义理解能力最强，可按相关性逐条排序 |
-| **答案合成** | Prompt + LLM | 多路上下文融合，带来源引用 |
-
-### 六、Prompt 模板库
-
-```
-prompts/
-├── README.md           # 使用说明与代码集成示例
-├── 术语提取.md         # 专业术语/缩写/定义识别 → JSON Schema
-├── 实体关系抽取.md     # 知识图谱三元组构建 → JSON Schema
-└── 文档摘要生成.md     # 结构化摘要 + 关键数据提取 → JSON Schema
-```
-
-每个模板均包含：角色定义、输入说明、任务描述、输出 JSON Schema、完整示例、注意事项。可直接拼接到 LLM 请求中。
-
-### 七、工程化能力
-
-| 能力 | 实现机制 |
-|------|----------|
-| **增量处理** | 文件 MD5 哈希 → `.processing_manifest.json` → 自动跳过未变化文件 |
-| **强制重跑** | `--force` 忽略增量记录，全量重新处理 |
-| **预览模式** | `--dry-run` 列出待处理文件清单，不实际执行 |
-| **文本清洗** | OCR 噪声修复、Unicode 规范化、空白清理 |
-| **配置分离** | `settings.py`（部署配置：路径/密钥/数据库）+ `config.py`（算法参数：阈值/大小） |
-| **处理器插件化** | 继承 `BaseProcessor` → 实现 2 个方法 → 注册即用 |
-| **断网可用** | TF-IDF 嵌入 + FAISS 检索 + BM25 关键词 → 完全离线工作 |
-
----
-
-## 安全与可靠性
-
-本系统已通过严格的安全审计（28 个文件逐行审查），结论如下：
-
-| 检查项 | 结果 | 说明 |
-|--------|:--:|------|
-| 隐蔽外连 / 后门 | ✅ 无 | 所有对外请求均为用户主动配置的可选功能 |
-| 遥测 / 数据上报 | ✅ 无 | ChromaDB 遥测已显式关闭 |
-| API Key 安全 | ✅ | 仅从环境变量读取，日志不记录密钥 |
-| 文档内容泄露 | ✅ | 日志仅记录计数/文件名/状态，不记录原文 |
-| `exec`/`eval`/`pickle` | ✅ 零出现 | — |
-| `subprocess` 注入风险 | ✅ 无 | 仅调用本地 LibreOffice/antiword，无 `shell=True` |
-| 文件越权访问 | ✅ | 所有读写限定在项目根目录内 |
-| 绝对路径脱敏 | ✅ | 输出文件中仅含相对路径 |
-| LLM URL 一致性 | ✅ | 三处调用统一从 settings.py 读取 |
-| 空数据 / 异常输入 | ✅ | 已增加 ndim 守卫、递归深度限制、URL 斜杠处理 |
-
----
-
-## 项目规模
-
-| 指标 | 数值 |
-|------|:----:|
-| Python 源文件 | 28 个 |
-| Prompt 模板 | 4 个 |
-| 总代码行数 | 4,031 行 |
-| 功能模块 | 7 个 |
-| 文档处理器 | 8 个（覆盖 7 大类格式） |
-| 检索层级 | 3 层 |
-
-### 模块结构
+## 项目结构
 
 ```
 RAG数据处理/
-├── main.py                    # 主流水线入口
-├── settings.py                # 部署配置（密钥/路径/模型选择）
-├── config.py                  # 算法参数（分块/去重阈值）
-├── import_to_vectordb.py      # CSV → 向量数据库 导入工具
-├── search_demo.py             # 检索演示 CLI
-├── requirements.txt           # Python 依赖
-├── README.md                  # 使用文档
-├── PROJECT_INTRO.md           # 本文件
-│
-├── knowledge_base/            # 文档源文件目录（放入待处理文档）
-├── output/                    # 向量化结果输出
-├── chroma_db/                 # ChromaDB 持久化目录
-├── prompts/                   # Prompt 模板库
-│
-├── processors/ (8 文件)       # 文档解析引擎
-│   ├── base_processor.py      #   抽象基类（扩展入口）
-│   ├── word_processor.py      #   .docx 处理器
-│   ├── doc_processor.py       #   .doc 处理器
-│   ├── pdf_processor.py       #   .pdf 处理器
-│   ├── excel_processor.py     #   .xlsx/.xls 处理器
-│   ├── pptx_processor.py      #   .pptx 处理器
-│   ├── image_processor.py     #   图片 OCR 处理器
-│   └── text_processor.py      #   .txt/.md/.csv/.json/.html 处理器
-│
-├── chunker/                   # 语义分块引擎
-├── embedder/                  # 向量化引擎（TF-IDF / Sentence-Transformer）
-├── storage/ (3 文件)          # 存储层（FileStorage + ChromaDB + Milvus）
-├── retrieval/ (3 文件)        # 检索引擎（LocalRetriever + Reranker + SearchPipeline）
-└── utils/                     # 工具函数
+├── main.py                      # 主入口，自动扫描 knowledge_base/ 并处理
+├── settings.py                  # ★ 部署配置（路径、密钥、数据库连接等）
+├── config.py                    # 算法参数（分块阈值、chunk大小等）
+├── requirements.txt             # Python 依赖
+├── README.md                    # 本文件
+├── knowledge_base/              # ★ 知识库源文件目录（文档放这里）
+│   └── .gitkeep
+├── output/                      # 向量化结果输出目录
+├── processors/                  # 文档处理器
+│   ├── base_processor.py        # 抽象基类（扩展入口）
+│   ├── word_processor.py        # Word (.docx) — 双栏检测
+│   ├── pdf_processor.py         # PDF OCR
+│   ├── excel_processor.py       # Excel (.xlsx/.xls)
+│   └── image_processor.py       # 图片 OCR
+├── chunker/
+│   └── semantic_chunker.py      # 语义分块算法
+├── embedder/
+│   └── embedder.py              # 双模式：TF-IDF离线 + Sentence-Transformer
+├── storage/
+│   ├── file_storage.py          # CSV/Excel 存储
+│   └── vector_db_interface.py   # 向量数据库接口（预留）
+└── utils/
+    └── helpers.py               # 工具函数
 ```
 
----
+## 配置文件说明
 
-## 快速开始
+| 文件 | 用途 | 修改频率 |
+|------|------|----------|
+| **`settings.py`** | 部署配置：路径、API密钥、数据库连接、模型选择 | 部署时修改 |
+| **`config.py`** | 算法参数：分块阈值、chunk大小、重叠比例 | 调优时修改 |
 
-### 1. 安装依赖
+### settings.py 主要内容
+
+```python
+# 路径
+KNOWLEDGE_BASE_DIR = "./knowledge_base"   # 文档存放目录
+OUTPUT_DIR = "./output"                   # 向量输出目录
+OUTPUT_FORMAT = "csv"                     # csv 或 excel
+
+# 嵌入模式
+USE_TFIDF = True                          # True=离线TF-IDF, False=在线模型
+EMBEDDING_MODEL_NAME = "paraphrase-multilingual-MiniLM-L12-v2"
+TFIDF_MAX_FEATURES = 512                  # TF-IDF 向量维度
+
+# OCR
+OCR_LANG = "chi_sim+eng"                  # Tesseract 语言
+PDF_DPI = 300
+
+# 数据库连接（预留）
+MILVUS_HOST = "localhost"
+MILVUS_PORT = 19530
+VECTOR_DB_TYPE = "file"                   # "file" | "milvus" | "chroma"
+
+# 大模型 API（预留）
+LLM_API_KEY = "your-api-key-here"
+LLM_BASE_URL = "https://api.openai.com/v1"
+LLM_MODEL = "gpt-4o"
+```
+
+## 已实现功能
+
+### 文档解析
+- **Word (.docx)** — 段落/表格/页眉页脚提取，**双栏/多栏布局检测**
+- **PDF (.pdf)** — OCR 文字识别（基于 Tesseract），支持中英文混合
+- **Excel (.xlsx/.xls)** — 多 Sheet 遍历，保留行列结构信息
+- **图片 (.png/.jpg/.bmp/.tiff)** — OCR 文字识别，含图片预处理增强
+
+### 语义分块
+- 基于句子嵌入的 **语义相似度自适应分块**，在知识边界处切分
+- 自然段落/句子边界优先，保持知识点完整性
+- 相邻 chunk 文本重叠，避免边界信息丢失
+- 参数集中在 `config.py` 中调优
+
+### 向量化
+- **双模式嵌入**：TF-IDF 离线模式（默认，无需联网） / Sentence-Transformer 在线模式
+- 通过 `settings.py` 中 `USE_TFIDF` 一键切换
+- 支持中英文混合文本，批量编码 + L2归一化
+
+### 存储
+- **CSV** 输出（默认）或 **Excel** 输出
+- 含 chunk_id、原文、embedding JSON、元数据
+- 支持多文件批量处理后自动合并
+- 预留 **向量数据库接口** (`VectorDBInterface`)，后续可接入 Milvus/Chroma 等
+
+### 扩展性
+- 新增文档类型：继承 `BaseProcessor` → 实现 `can_handle()` + `extract_text()` → 在 `processors/__init__.py` 注册
+- 新增向量数据库：实现 `VectorDBInterface` 抽象类 → 修改 `settings.py` 中 `VECTOR_DB_TYPE`
+- 检索模块预留位置，可在 `storage/` 下扩展
+
+## 环境准备
+
+### 1. 安装 Python 依赖
 
 ```bash
 pip install -r requirements.txt
 ```
 
-### 2. 放入文档
+### 2. 安装 Tesseract OCR（PDF/图片处理必需）
+
+- **Windows**: 下载安装 [Tesseract-OCR](https://github.com/UB-Mannheim/tesseract/wiki)
+- **macOS**: `brew install tesseract tesseract-lang`
+- **Linux**: `sudo apt install tesseract-ocr tesseract-ocr-chi-sim`
+
+确保安装中文语言包（`chi_sim`）。
+
+### 3. 安装 Poppler（PDF 处理必需）
+
+- **Windows**: 下载 [poppler-windows](https://github.com/oschwartz10612/poppler-windows/releases/)，将 `bin/` 目录添加到 PATH
+- **macOS**: `brew install poppler`
+- **Linux**: `sudo apt install poppler-utils`
+
+### 4. 安装 PyTorch（可选，GPU 加速）
+
+```bash
+# CUDA 版本
+pip install torch --index-url https://download.pytorch.org/whl/cu118
+# 或 CPU 版本
+pip install torch --index-url https://download.pytorch.org/whl/cpu
+```
+
+## 使用方式
+
+### 第一步：放入文档
 
 将需要处理的文档放入 `knowledge_base/` 文件夹：
 
@@ -218,90 +140,110 @@ knowledge_base/
 ├── 产品手册.docx
 ├── 技术报告.pdf
 ├── 数据表格.xlsx
-├── 会议演示.pptx
-└── 笔记.txt
+└── 截图.png
 ```
 
-### 3. 一键处理
+### 第二步：修改配置（可选）
+
+编辑 `settings.py`，按需修改：
+- **嵌入模式**: `USE_TFIDF = True` (离线) 或 `False` (在线模型)
+- **输出路径**: `OUTPUT_DIR = "./output"`
+- **输出格式**: `OUTPUT_FORMAT = "csv"` 或 `"excel"`
+- **OCR 语言**: `OCR_LANG = "chi_sim+eng"`
+- **数据库连接**: 接入向量数据库时填写
+
+### 第三步：运行
 
 ```bash
+# 默认模式：自动扫描 knowledge_base/ 文件夹
 python main.py
+
+# 查看当前配置
+python main.py --show-settings
+
+# 指定其他输入目录
+python main.py --input ./my_docs/
+
+# 指定输出目录和格式
+python main.py --output ./my_vectors/ --format excel
+
+# 调整分块参数
+python main.py --similarity 0.7 --max-chars 800
+
+# 查看支持的文件格式
+python main.py --list-formats
 ```
 
-系统自动：扫描文档 → 解析文本 → 语义分块 → 向量化 → 存入 ChromaDB + CSV 备份。
+### 完整参数说明
 
-### 4. 开始检索
+| 参数 | 简写 | 默认值 | 说明 |
+|------|------|--------|------|
+| `--input` | `-i` | `settings.KNOWLEDGE_BASE_DIR` | 输入目录路径 |
+| `--output` | `-o` | `settings.OUTPUT_DIR` | 输出目录 |
+| `--format` | `-f` | `settings.OUTPUT_FORMAT` | 输出格式: `csv` 或 `excel` |
+| `--similarity` | `-s` | `0.6` | 语义分块相似度阈值 (0~1) |
+| `--max-chars` | | `1000` | 单个 chunk 最大字符数 |
+| `--min-chars` | | `80` | 单个 chunk 最小字符数 |
+| `--overlap` | | `0.15` | chunk 间重叠比例 (0~0.3) |
+| `--show-settings` | | | 查看当前 settings.py 配置 |
+| `--list-formats` | | | 列出所有支持的文件格式 |
+| `--verbose` | `-v` | | 详细日志 |
 
-```bash
-# 单次查询
-python search_demo.py --query "Python开发经验"
+## 输出文件格式
 
-# 交互模式
-python search_demo.py
-```
+生成的 CSV 文件包含以下列：
 
----
-
-## 核心优势
-
-### 1. 零门槛，开箱即用
-
-- 无需搭建服务器、无需配置数据库、无需网络连接
-- 默认 TF-IDF 离线模式 + 本地 FAISS/BM25 检索，安装 pip 依赖即可运行
-- 接入 ChromaDB/LM 后自动升级为完整 RAG 方案
-
-### 2. 语义分块，非暴力切割
-
-- 基于嵌入向量相似度在"知识点边界"切分，不同于常见的固定 500 字切分
-- 知识不会被拦腰截断，检索结果更完整、更准确
-
-### 3. 3 层召回，多路互补
-
-- **BM25 关键词**保证专有名词、编号、术语的精确匹配
-- **向量语义**捕获同义词、改写、跨语言语义
-- **双路加权合并 + CrossEncoder 精排 + LLM 合路**，层层提纯
-
-### 4. 配置分离，安全可控
-
-- `settings.py`：部署时改一次（路径、密钥、数据库连接）
-- `config.py`：算法调优时改（分块参数、相似度阈值）
-- API Key 从环境变量读取，不落地代码仓库
-- 输出文件不含主机敏感信息
-
-### 5. 高度可扩展
-
-- **新增文档格式**：继承 `BaseProcessor` → 实现 `can_handle()` + `extract_text()` → 注册
-- **新增向量数据库**：实现 `VectorDBInterface` → 修改 `VECTOR_DB_TYPE`
-- **新增 LLM 后端**：修改 `LLM_BASE_URL` 一行配置（OpenAI / Ollama / vLLM / DeepSeek 全兼容）
-- **Prompt 模板库**：`prompts/` 目录下添加 `.md` 文件即生效
-
-### 6. 生产级可靠性
-
-- 增量处理、预览模式、强制重跑、错误隔离
-- 向量库自动更新：文档修改后自动清理旧版本 → 插入新版本，无重复数据
-- 3 个 Blocker 级 + 5 个 High 级 + 7 个 Medium 级问题已修复
-- 已通过 28 文件逐行安全审计
-
----
-
-## 适用场景
-
-| 场景 | 说明 |
+| 列名 | 说明 |
 |------|------|
-| **企业知识库** | 内部文档体系化管理，员工自然语言检索 |
-| **智能客服** | 产品手册/FAQ 向量化，自动匹配最优答案 |
-| **法律/合同审查** | 多格式合同批量解析，条款级精准检索 |
-| **学术研究** | 论文 PDF 批量处理，跨文献知识发现 |
-| **个人知识管理** | 笔记/日记/收藏文章一键向量化，终身可检索 |
-| **政府/军工** | 完全断网运行，数据不出本地，满足合规要求 |
+| `chunk_id` | 唯一 chunk ID（源文件名_序号） |
+| `source_file` | 源文件名 |
+| `chunk_text` | chunk 文本内容 |
+| `embedding_json` | 向量 JSON 数组（384维） |
+| `char_count` | chunk 字符数 |
+| `metadata_json` | 元数据 JSON（来源、页数等） |
+| `created_at` | 处理时间 |
 
----
+## 扩展指南
 
-## 许可证
+### 新增文档类型
 
-MIT License — 可自由用于个人、企业及商业项目。
+1. 在 `processors/` 下创建新文件，继承 `BaseProcessor`
+2. 实现 `can_handle()` — 基于扩展名判断
+3. 实现 `extract_text()` — 提取纯文本
+4. 在 `processors/__init__.py` 的 `get_all_processors()` 中注册
 
----
+```python
+# processors/my_processor.py
+from .base_processor import BaseProcessor
 
-*文档生成日期：2026-07-12 | 审计状态：已通过 | 投产建议：可部署*
+class MyProcessor(BaseProcessor):
+    processor_name = "my_format"
 
+    def can_handle(self, file_path: str) -> bool:
+        return file_path.endswith(".myext")
+
+    def extract_text(self, file_path: str) -> str:
+        # 自定义提取逻辑
+        return extracted_text
+```
+
+### 接入向量数据库
+
+实现 `storage/vector_db_interface.py` 中的 `VectorDBInterface` 抽象类，然后在 `main.py` 中切换存储后端即可。
+
+## 项目状态
+
+- [x] Word 文档解析（含双栏检测）
+- [x] PDF OCR 识别
+- [x] Excel 表格解析
+- [x] 图片 OCR 识别
+- [x] 语义分块
+- [x] 文本向量化
+- [x] CSV/Excel 存储
+- [x] 向量数据库接口占位
+- [ ] 检索模块（后续开发）
+- [ ] 向量数据库实际接入（后续开发）
+
+## License
+
+MIT
